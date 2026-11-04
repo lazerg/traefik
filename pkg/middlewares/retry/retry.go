@@ -221,7 +221,7 @@ func (r *retry) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return nil
 		}
 
-		retryResponseWriter := newResponseWriter(rw, statusCodes, start, r.timeout, r.disableRetryOnNetworkError)
+		retryResponseWriter := newResponseWriter(req.Context(), rw, statusCodes, start, r.timeout, r.disableRetryOnNetworkError)
 
 		retryReq := req
 		if !r.disableRetryOnNetworkError {
@@ -252,11 +252,6 @@ func (r *retry) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	err := backoff.RetryNotify(operation, backOff, notify)
 	if err != nil {
 		logger.Debug().Err(err).Msg("Final retry attempt failed")
-
-		// The back-off stops before the last attempt when the request context is done,
-		// so the last attempt is run here to make sure a response is written.
-		attempts = r.attempts
-		_ = operation()
 	}
 
 	if currentSpan != nil {
@@ -282,8 +277,9 @@ func (r *retry) newBackOff() backoff.BackOff {
 	return b
 }
 
-func newResponseWriter(rw http.ResponseWriter, statusCodeRanges types.HTTPCodeRanges, start time.Time, timeout time.Duration, disableRetryOnNetworkError bool) *responseWriter {
+func newResponseWriter(ctx context.Context, rw http.ResponseWriter, statusCodeRanges types.HTTPCodeRanges, start time.Time, timeout time.Duration, disableRetryOnNetworkError bool) *responseWriter {
 	return &responseWriter{
+		ctx:                        ctx,
 		responseWriter:             rw,
 		headers:                    make(http.Header),
 		statusCodeRange:            statusCodeRanges,
@@ -294,6 +290,7 @@ func newResponseWriter(rw http.ResponseWriter, statusCodeRanges types.HTTPCodeRa
 }
 
 type responseWriter struct {
+	ctx            context.Context
 	responseWriter http.ResponseWriter
 	headers        http.Header
 
@@ -335,10 +332,14 @@ func (r *responseWriter) WriteHeader(code int) {
 	}
 
 	timedOut := r.timeout > 0 && time.Since(r.start) >= r.timeout
+	// The back-off stops once the request context is done (e.g. the client went away),
+	// so no other attempt would write a response: this one must flow through to the client.
+	canRetry := !timedOut && r.ctx.Err() == nil
+
 	// Retry on a network error only when the request reached the backend proxy
 	// but no bytes were sent to the backend yet. Responses produced before reaching the
 	// proxy (e.g. an auth middleware returning 401) must flow through to the client.
-	if !timedOut && !r.disableRetryOnNetworkError && r.proxyReached.Load() && !r.wroteRequest.Load() {
+	if canRetry && !r.disableRetryOnNetworkError && r.proxyReached.Load() && !r.wroteRequest.Load() {
 		r.shouldNotWrite = true
 		return
 	}
@@ -355,7 +356,7 @@ func (r *responseWriter) WriteHeader(code int) {
 	}
 
 	if r.statusCodeRange != nil {
-		r.shouldNotWrite = !timedOut && r.statusCodeRange.Contains(code)
+		r.shouldNotWrite = canRetry && r.statusCodeRange.Contains(code)
 	}
 
 	if r.shouldNotWrite {

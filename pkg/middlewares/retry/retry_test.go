@@ -278,21 +278,84 @@ func TestRetryOnStatusWhenProxyNotReached(t *testing.T) {
 	assert.Equal(t, 1, retryListener.timesCalled)
 }
 
-func TestRetryCanceledContext(t *testing.T) {
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		proxyhttputil.ErrorHandler(rw, req, req.Context().Err())
-	})
+func TestRetryContextDone(t *testing.T) {
+	testCases := []struct {
+		desc           string
+		config         dynamic.Retry
+		deadline       bool
+		cancelInNext   bool
+		wantStatusCode int
+	}{
+		{
+			desc:           "canceled before the first attempt",
+			config:         dynamic.Retry{Attempts: 3},
+			wantStatusCode: proxyhttputil.StatusClientClosedRequest,
+		},
+		{
+			desc:           "canceled before the first attempt with back-off",
+			config:         dynamic.Retry{Attempts: 3, InitialInterval: ptypes.Duration(time.Hour)},
+			wantStatusCode: proxyhttputil.StatusClientClosedRequest,
+		},
+		{
+			desc:           "canceled during the first attempt",
+			config:         dynamic.Retry{Attempts: 3, InitialInterval: ptypes.Duration(time.Hour)},
+			cancelInNext:   true,
+			wantStatusCode: proxyhttputil.StatusClientClosedRequest,
+		},
+		{
+			desc:           "canceled with a retriable status code",
+			config:         dynamic.Retry{Attempts: 3, Status: []string{"499"}},
+			wantStatusCode: proxyhttputil.StatusClientClosedRequest,
+		},
+		{
+			desc:           "deadline exceeded",
+			config:         dynamic.Retry{Attempts: 3},
+			deadline:       true,
+			wantStatusCode: http.StatusGatewayTimeout,
+		},
+	}
 
-	retry, err := New(t.Context(), WrapHandler(next), dynamic.Retry{Attempts: 3}, &countingRetryListener{}, "traefikTest")
-	require.NoError(t, err)
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if test.deadline {
+				ctx, cancel = context.WithDeadline(t.Context(), time.Now())
+			} else {
+				ctx, cancel = context.WithCancel(t.Context())
+			}
+			t.Cleanup(cancel)
 
-	recorder := httptest.NewRecorder()
-	retry.ServeHTTP(recorder, testhelpers.MustNewRequest(http.MethodGet, "http://test", http.NoBody).WithContext(ctx))
+			if !test.cancelInNext {
+				cancel()
+			}
 
-	assert.Equal(t, proxyhttputil.StatusClientClosedRequest, recorder.Code)
+			var callCount int
+			next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				callCount++
+
+				if test.cancelInNext {
+					cancel()
+				}
+
+				// Answers as the proxy does when the request context is done.
+				proxyhttputil.ErrorHandler(rw, req, req.Context().Err())
+			})
+
+			retryListener := &countingRetryListener{}
+			retry, err := New(t.Context(), WrapHandler(next), test.config, retryListener, "traefikTest")
+			require.NoError(t, err)
+
+			recorder := httptest.NewRecorder()
+			retry.ServeHTTP(recorder, testhelpers.MustNewRequest(http.MethodGet, "http://test", http.NoBody).WithContext(ctx))
+
+			assert.Equal(t, test.wantStatusCode, recorder.Code)
+			assert.Equal(t, 1, callCount)
+			assert.Equal(t, 0, retryListener.timesCalled)
+		})
+	}
 }
 
 func TestRetryWithFlush(t *testing.T) {
